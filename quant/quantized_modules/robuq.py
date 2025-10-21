@@ -1,10 +1,31 @@
+import math
+import warnings
+from typing import TYPE_CHECKING, cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import warnings
-from .hadamard_utils import *
-import math
 from torch.autograd import Function
+
+from .hadamard_utils import *
+
+if TYPE_CHECKING:
+    from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda as _svdq_gemm_w4a4_cuda
+else:  # pragma: no cover - runtime import
+    _svdq_gemm_w4a4_cuda = None
+
+try:  # pragma: no cover - optional dependency
+    from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda
+
+    _NUNCHAKU_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    svdq_gemm_w4a4_cuda = None
+    _NUNCHAKU_AVAILABLE = False
+
+INT4_GROUP_SIZE = 64
+INT4_STORAGE_MAX = (1 << 3) - 1  # signed range [-8, 7]
+W4A4_CHANNEL_PAD = 128
+W4A4_BATCH_PAD = 256
 # 预计算的均匀量化表
 #-----------Gaussian Optimal Uniform Quantization--------------
 UNIFORM_QUANT_TABLE = {
@@ -18,6 +39,51 @@ UNIFORM_QUANT_TABLE = {
     8: {'a_opt': 3.937585, 'delta': 0.030762, 'mse': 0.00008769}
 }
 
+
+
+def _pack_int4_blocks(q: torch.Tensor) -> torch.Tensor:
+    """Pack signed int4 values into int8.
+
+    Args:
+        q: Tensor with shape (B, G, 64) and dtype int16 containing values in [-8, 7].
+
+    Returns:
+        Packed tensor with shape (B, G * 32) and dtype int8.
+    """
+
+    if q.dtype not in (torch.int16, torch.int32, torch.int64):
+        raise TypeError("Expected signed integer tensor for int4 packing.")
+    if q.shape[-1] != 64:
+        raise ValueError("Last dimension must be 64 for int4 packing.")
+
+    q_view = q.view(*q.shape[:-1], 32, 2)
+    low = (q_view[..., 0] & 0xF).to(torch.uint8)
+    high = (q_view[..., 1] & 0xF).to(torch.uint8)
+    packed = low | (high << 4)
+    return packed.reshape(q.shape[0], -1).to(torch.int8)
+
+
+def _symmetric_int4_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize grouped values to int4 with per-sample scales.
+
+    Args:
+        groups: Tensor with shape (B, G, 64) and dtype float16/float32.
+
+    Returns:
+        packed_q: int8 tensor with shape (B, G * 32).
+        scales: float16 tensor with shape (G, B).
+    """
+
+    if groups.dtype not in (torch.float16, torch.float32, torch.bfloat16):
+        raise TypeError("Expected floating tensor for int4 quantization.")
+
+    max_abs = groups.abs().amax(dim=-1)
+    scale = max_abs / float(INT4_STORAGE_MAX)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+
+    q = torch.round(groups / scale.unsqueeze(-1)).clamp(-8, 7).to(torch.int16)
+    packed = _pack_int4_blocks(q)
+    return packed.contiguous(), scale.transpose(0, 1).contiguous().to(torch.float16)
 class UniformQuantSTE(nn.Module):
     def __init__(self, bits):
         """
@@ -245,20 +311,35 @@ def quantize_linear_weights_perchannel(weight, clip_value=1.0):
 #    assert weight.dim() == 2, "权重必须是2D张量 [out_features, in_features]"
     return TernaryPerChannel.apply(weight, 1e-6, clip_value)
 class RobuQLinear(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True,pretained_weight=None,if_lora=True,if_hadamard=False,n_bits=4,w_bits=1.58):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        pretained_weight=None,
+        if_lora=True,
+        if_hadamard=False,
+        n_bits=4,
+        w_bits=1.58,
+    ):
         super(RobuQLinear, self).__init__(in_features, out_features, bias=bias)
         if pretained_weight is not None:
             self.weight = pretained_weight
+        self.n_bits = n_bits
+        self.w_bits = w_bits
         self.if_hadamard = if_hadamard
         if if_hadamard:
-            self.weight.data = self.hadamard_init(in_features, self.weight.data)  # 初始化权重矩阵
-        self.rank =   16#LoRA rank
+            with torch.no_grad():
+                self.weight.copy_(self.hadamard_init(in_features, self.weight.data))
+        self.rank = 16
         self.if_lora = False
-        if  if_lora and self.rank<min(in_features,out_features):
+        if if_lora and self.rank < min(in_features, out_features):
             self.if_lora = True
         if self.if_lora:
-            self.lora=LoRALinear(in_features, out_features, rank=self.rank,pretrained_weight=self.weight).to(self.weight.device)
-            self.weight = nn.Parameter(self.weight.data-self.lora.get_equiv_weight())
+            self.lora = LoRALinear(in_features, out_features, rank=self.rank, pretrained_weight=self.weight).to(
+                self.weight.device
+            )
+            self.weight = nn.Parameter(self.weight.data - self.lora.get_equiv_weight())
         if w_bits == 1.58:
             self.weight_quantize = quantize_linear_weights_perchannel
         else:
@@ -267,8 +348,15 @@ class RobuQLinear(nn.Linear):
             self.activation_quantize = nn.Identity()
         else:
             self.activation_quantize = QuantAct(quant_func=UniformQuantSTE(bits=n_bits))
-        self.cin=in_features
-        self.cout=out_features
+        self.cin = in_features
+        self.cout = out_features
+        self._use_w4a4 = _NUNCHAKU_AVAILABLE and n_bits == 4 and w_bits == 4
+        self._w4a4_ready = False
+        self._k_pad = math.ceil(self.cin / W4A4_CHANNEL_PAD) * W4A4_CHANNEL_PAD if self._use_w4a4 else self.cin
+        self._n_pad = math.ceil(self.cout / W4A4_CHANNEL_PAD) * W4A4_CHANNEL_PAD if self._use_w4a4 else self.cout
+        self._w4a4_qweight = None
+        self._w4a4_wscales = None
+        self._w4a4_bias = None
     def hadamard_init(self,in_features,weight):
         """
     对传入的权重矩阵执行随机哈达玛变换，并保存随机列向量供前向传播使用
@@ -310,28 +398,123 @@ class RobuQLinear(nn.Linear):
     def refresh_bits(self,a_bits,w_bits):
         self.activation_quantize = QuantAct(quant_func=UniformQuantSTE(bits=a_bits))
         self.weight_quantize = QuantAct(quant_func=UniformQuantSTE(bits=w_bits))
+        self.n_bits = a_bits
+        self.w_bits = w_bits
+        self._use_w4a4 = _NUNCHAKU_AVAILABLE and a_bits == 4 and w_bits == 4
+        self._w4a4_ready = False
     def forward(self, input):
+        if (
+            self._use_w4a4
+            and self._w4a4_ready
+            and input.dim() == 2
+            and input.device.type == "cuda"
+            and not torch.is_grad_enabled()
+            and not self.training
+        ):
+            return self._forward_w4a4(input)
+        return self._forward_fp(input)
+
+    def _forward_fp(self, input: torch.Tensor) -> torch.Tensor:
         if self.if_hadamard:
-            # 如果启用了哈达玛变换，则对输入进行变换
             input = self.activation_hadamard(input)
-       #------------lora--------------
-        if self.if_lora :
-
-            lora=self.lora(input)
-
-        #-----------activation quantization--------------
-        x = self.activation_quantize(input)
-
-        #-----------Weight quantization--------------
-        real_weights = self.weight
-        quantized_weights = self.weight_quantize(real_weights)
-
-        output = F.linear(x, quantized_weights, self.bias)
-
-        #-----------Add  lora ----------------------
+        lora = None
         if self.if_lora:
-            output=output+lora
+            lora_module = getattr(self, "lora", None)
+            if lora_module is not None:
+                lora = lora_module(input)
+        x = cast(torch.Tensor, self.activation_quantize(input))
+        quantized_weights = cast(torch.Tensor, self.weight_quantize(self.weight))
+        output = F.linear(x, quantized_weights, self.bias)
+        if lora is not None:
+            output = output + lora
         return output
+
+    def prepare_for_inference(self):
+        if not self._use_w4a4:
+            warnings.warn("W4A4 kernel不可用，回退到浮点前向。", RuntimeWarning)
+            return
+        if self._w4a4_ready:
+            return
+        if self.weight.device.type != "cuda":
+            warnings.warn("W4A4推理需要CUDA设备。", RuntimeWarning)
+            return
+        weight_fp16 = self.weight.detach().to(torch.float16)
+        qweight, wscales = self._quantize_weight_w4a4(weight_fp16)
+        self._w4a4_qweight = qweight
+        self._w4a4_wscales = wscales
+        if self.bias is not None:
+            bias_pad = torch.zeros((self._n_pad,), dtype=torch.float16, device=self.bias.device)
+            bias_pad[: self.cout] = self.bias.detach().to(torch.float16)
+            self._w4a4_bias = bias_pad
+        else:
+            self._w4a4_bias = None
+        self._w4a4_ready = True
+
+    def _quantize_weight_w4a4(self, weight_fp16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._use_w4a4:
+            raise RuntimeError("W4A4量化未启用")
+        n_pad = self._n_pad
+        k_pad = self._k_pad
+        weight_padded = torch.zeros((n_pad, k_pad), dtype=torch.float16, device=weight_fp16.device)
+        weight_padded[: self.cout, : self.cin] = weight_fp16
+        groups = weight_padded.view(n_pad, k_pad // INT4_GROUP_SIZE, INT4_GROUP_SIZE)
+        packed, scales = _symmetric_int4_quant(groups)
+        return packed, scales
+
+    def _quantize_activation_w4a4(self, input_fp16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        if not self._use_w4a4:
+            raise RuntimeError("W4A4量化未启用")
+        batch, in_features = input_fp16.shape
+        k_pad = self._k_pad
+        if in_features > k_pad:
+            raise ValueError("输入特征维度超过W4A4预设padding。")
+        batch_pad = math.ceil(batch / W4A4_BATCH_PAD) * W4A4_BATCH_PAD
+        act_pad = torch.zeros((batch_pad, k_pad), dtype=torch.float16, device=input_fp16.device)
+        act_pad[:batch, :in_features] = input_fp16
+        groups = act_pad.view(batch_pad, k_pad // INT4_GROUP_SIZE, INT4_GROUP_SIZE)
+        packed, scales = _symmetric_int4_quant(groups)
+        return packed, scales, batch_pad
+
+    def _forward_w4a4(self, input: torch.Tensor) -> torch.Tensor:
+        x = cast(torch.Tensor, input.to(torch.float16))
+        if self.if_hadamard:
+            x = self.activation_hadamard(x)
+        lora_out = None
+        if self.if_lora:
+            lora_module = getattr(self, "lora", None)
+            if lora_module is not None:
+                lora_dtype = lora_module.A.weight.dtype
+                lora_out = cast(torch.Tensor, lora_module(x.to(lora_dtype))).to(torch.float16)
+        act_packed, ascales, batch_pad = self._quantize_activation_w4a4(x)
+        out_pad = torch.zeros((batch_pad, self._n_pad), dtype=torch.float16, device=x.device)
+        try:
+            empty_lora_act = torch.empty((batch_pad, 0), dtype=torch.float32, device=x.device)
+            empty_lora_up = torch.empty((self._n_pad, 0), dtype=torch.float16, device=x.device)
+            svdq_gemm_w4a4_cuda(
+                act=act_packed,
+                wgt=self._w4a4_qweight,
+                out=out_pad,
+                ascales=ascales,
+                wscales=self._w4a4_wscales,
+                bias=self._w4a4_bias,
+                lora_act_in=empty_lora_act,
+                lora_up=empty_lora_up,
+                lora_down=None,
+                lora_act_out=None,
+                smooth_factor=None,
+                act_unsigned=False,
+                lora_scales=[],
+                fp4=False,
+            )
+        except Exception as exc:
+            warnings.warn(f"W4A4 kernel调用失败，自动回退到浮点实现: {exc}", RuntimeWarning)
+            self._w4a4_ready = False
+            return self._forward_fp(input)
+
+        output = out_pad[: input.shape[0], : self.cout]
+        if lora_out is not None:
+            output = output + lora_out[: input.shape[0], : self.cout]
+        return output.to(input.dtype)
 
 
 def init_RobuQLinear_from_Linear(linear,n_bits=4,w_bits=4,if_hadamard=True,if_lora=True):
@@ -339,6 +522,4 @@ def init_RobuQLinear_from_Linear(linear,n_bits=4,w_bits=4,if_hadamard=True,if_lo
     robuq_linear = RobuQLinear(linear.in_features, linear.out_features, linear.bias is not None,linear.weight,if_lora=if_lora,if_hadamard=if_hadamard,n_bits=n_bits,w_bits=w_bits)
     if linear.bias is not None:
         robuq_linear.bias = linear.bias
-
     return robuq_linear
-

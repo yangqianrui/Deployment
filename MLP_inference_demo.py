@@ -23,9 +23,11 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # 创建
 model = MLP().to(device)
 # 量化模型
-model.layer2 = replace_linear_layer(model.layer2, nbits=2, w_bits=2, if_hadamard=True, if_lora=True)
+model.layer2 = replace_linear_layer(model.layer2, nbits=4, w_bits=4, if_hadamard=False, if_lora=False)
 # 加载训练好的模型参数
 model.load_state_dict(torch.load("mlp_model.pt"))
+if hasattr(model.layer2, "prepare_for_inference"):
+    model.layer2.prepare_for_inference()
 model.eval()  # 设置为推理模式
 
 # 生成测试数据（我们可以使用训练数据，也可以生成新的数据进行推理）

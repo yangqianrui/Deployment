@@ -53,7 +53,7 @@ for epoch in range(num_epochs):
     if (epoch + 1) % 100 == 0:
         print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.4f}')
 # 替换中间线性层为RobuQLinear
-model.layer2 = replace_linear_layer(model.layer2, nbits=2, w_bits=2, if_hadamard=True, if_lora=True)
+model.layer2 = replace_linear_layer(model.layer2, nbits=4, w_bits=4, if_hadamard=False, if_lora=False)
 
 # QAT训练
 num_epochs = 2000
