@@ -42,13 +42,13 @@ UNIFORM_QUANT_TABLE = {
 
 
 def _pack_int4_blocks(q: torch.Tensor) -> torch.Tensor:
-    """Pack signed int4 values into int8.
+    """Pack signed int4 values into uint8 (for nunchaku compatibility).
 
     Args:
         q: Tensor with shape (B, G, 64) and dtype int16 containing values in [-8, 7].
 
     Returns:
-        Packed tensor with shape (B, G * 32) and dtype int8.
+        Packed tensor with shape (B, G * 32) and dtype uint8.
     """
 
     if q.dtype not in (torch.int16, torch.int32, torch.int64):
@@ -60,7 +60,7 @@ def _pack_int4_blocks(q: torch.Tensor) -> torch.Tensor:
     low = (q_view[..., 0] & 0xF).to(torch.uint8)
     high = (q_view[..., 1] & 0xF).to(torch.uint8)
     packed = low | (high << 4)
-    return packed.reshape(q.shape[0], -1).to(torch.int8)
+    return packed.reshape(q.shape[0], -1)
 
 
 def _symmetric_int4_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

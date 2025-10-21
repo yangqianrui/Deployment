@@ -13,3 +13,5 @@ pip install -e . --no-build-isolation --config-settings editable_mode=compat
 1.cuda与pytorch不匹配 2.不要直接用pip install fast-hadamard-transform
 
 接下来，直接顺着报错把剩下的库都安装了，没啥特别的
+
+https://nunchaku.tech/docs/nunchaku/installation/installation.html

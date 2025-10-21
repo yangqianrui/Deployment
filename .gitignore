@@ -1,0 +1,89 @@
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# PyTorch模型文件
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# 生成的图像和结果
+*.png
+*.jpg
+*.jpeg
+*.pdf
+mlp_fitting_result*.png
+
+# 调试和测试脚本
+test_*.py
+debug_*.py
+verify_*.py
+MLP_inference_debug.py
+MLP_inference_no_w4a4.py
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+logs/
+
+# 数据文件
+data/
+*.csv
+*.npy
+*.npz
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 编译的C++/CUDA扩展
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.cu.o
+
+# Coverage报告
+htmlcov/
+.coverage
+.coverage.*
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# pytest
+.pytest_cache/
+
+# 本地配置
+.env
+.env.local
+config.local.yml
+
