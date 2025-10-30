@@ -23,7 +23,10 @@ except Exception:  # pragma: no cover - optional dependency
     _NUNCHAKU_AVAILABLE = False
 
 INT4_GROUP_SIZE = 64
-INT4_STORAGE_MAX = (1 << 3) - 1  # signed range [-8, 7]
+# 定义不同位宽的存储最大值 (2^(N-1) - 1)
+INT2_STORAGE_MAX = (1 << 1) - 1  # 1
+INT3_STORAGE_MAX = (1 << 2) - 1  # 3
+INT4_STORAGE_MAX = (1 << 3) - 1  # 7, 原始值
 W4A4_CHANNEL_PAD = 128
 W4A4_BATCH_PAD = 256
 # 预计算的均匀量化表
@@ -84,6 +87,64 @@ def _symmetric_int4_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     q = torch.round(groups / scale.unsqueeze(-1)).clamp(-8, 7).to(torch.int16)
     packed = _pack_int4_blocks(q)
     return packed.contiguous(), scale.transpose(0, 1).contiguous().to(torch.float16)
+
+def _symmetric_int3_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize grouped values to int3, but pack as int4 for compatibility.
+    Upscales quantized values by 2 (range [-8, 6]) and adjusts scale by / 2.0.
+    """
+    if groups.dtype not in (torch.float16, torch.float32, torch.bfloat16):
+        raise TypeError("Expected floating tensor for int3 quantization.")
+
+    max_abs = groups.abs().amax(dim=-1)
+    scale = max_abs / float(INT3_STORAGE_MAX) # scale by 3
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    
+    # Quantize to [-4, 3]
+    q = torch.round(groups / scale.unsqueeze(-1)).clamp(-4, 3)
+    
+    # Upscale to 4-bit range [-8, 6]
+    q_upscaled = (q * 2).to(torch.int16)
+    
+    # Adjust scale
+    scale_adjusted = scale / 2.0
+    
+    packed = _pack_int4_blocks(q_upscaled)
+    return packed.contiguous(), scale_adjusted.transpose(0, 1).contiguous().to(torch.float16)
+
+def _symmetric_int2_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize grouped values to int2, but pack as int4 for compatibility.
+    Upscales quantized values by 4 (range [-8, 4]) and adjusts scale by / 4.0.
+    """
+    if groups.dtype not in (torch.float16, torch.float32, torch.bfloat16):
+        raise TypeError("Expected floating tensor for int2 quantization.")
+
+    max_abs = groups.abs().amax(dim=-1)
+    # For 2 bits (4 levels), max abs value is 1 (if range is [-2, 1]) 
+    # or 2 if we allow [-2, 1]. Let's use 1 ([-2, 1] -> 3 levels?)
+    # Let's check int4: max_abs / 7. q.clamp(-8, 7).
+    # Let's use 2 levels: [-1, 1]. Max abs = 1.
+    # storage_max = 1 ([-2, 1] range has 4 values, but max abs is 2?)
+    # Let's assume 2 bits = 4 levels = -2, -1, 0, 1. Max storage = 1.5?
+    # Let's stick to the pattern: 2^(N-1) - 1
+    # N=2 -> 2^1 - 1 = 1.
+    scale = max_abs / float(INT2_STORAGE_MAX) # scale by 1
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    
+    # Quantize to [-2, 1] (This is 4 levels, but asymmetric. Let's try [-1, 1] (3 levels))
+    # Let's use [-2, 1] (4 levels)
+    q = torch.round(groups / scale.unsqueeze(-1)).clamp(-2, 1) 
+    
+    # Upscale to 4-bit range [-8, 4]
+    q_upscaled = (q * 4).to(torch.int16)
+    
+    # Adjust scale
+    scale_adjusted = scale / 4.0
+
+    packed = _pack_int4_blocks(q_upscaled)
+    return packed.contiguous(), scale_adjusted.transpose(0, 1).contiguous().to(torch.float16)
+
 class UniformQuantSTE(nn.Module):
     def __init__(self, bits):
         """
@@ -350,13 +411,31 @@ class RobuQLinear(nn.Linear):
             self.activation_quantize = QuantAct(quant_func=UniformQuantSTE(bits=n_bits))
         self.cin = in_features
         self.cout = out_features
+        # 仅当 A 和 W 都是4bit时，才启用Nunchaku W4A4
         self._use_w4a4 = _NUNCHAKU_AVAILABLE and n_bits == 4 and w_bits == 4
+        # 针对 2/3 bit，我们复用 4-bit 算子，因此也设置 _use_w4a4
+        if _NUNCHAKU_AVAILABLE and n_bits in [2, 3] and w_bits in [2, 3] and n_bits == w_bits:
+             self._use_w4a4 = True
+             
         self._w4a4_ready = False
         self._k_pad = math.ceil(self.cin / W4A4_CHANNEL_PAD) * W4A4_CHANNEL_PAD if self._use_w4a4 else self.cin
         self._n_pad = math.ceil(self.cout / W4A4_CHANNEL_PAD) * W4A4_CHANNEL_PAD if self._use_w4a4 else self.cout
         self._w4a4_qweight = None
         self._w4a4_wscales = None
         self._w4a4_bias = None
+        
+        # 根据位宽选择W4A4兼容的量化函数
+        if self._use_w4a4:
+            if n_bits == 4 and w_bits == 4:
+                self._quant_fn_w4a4 = _symmetric_int4_quant
+            elif n_bits == 3 and w_bits == 3:
+                self._quant_fn_w4a4 = _symmetric_int3_quant
+            elif n_bits == 2 and w_bits == 2:
+                self._quant_fn_w4a4 = _symmetric_int2_quant
+            else:
+                # 混合精度 W4A2 W4A3 等暂不启用
+                self._use_w4a4 = False
+
     def hadamard_init(self,in_features,weight):
         """
     对传入的权重矩阵执行随机哈达玛变换，并保存随机列向量供前向传播使用
@@ -400,8 +479,18 @@ class RobuQLinear(nn.Linear):
         self.weight_quantize = QuantAct(quant_func=UniformQuantSTE(bits=w_bits))
         self.n_bits = a_bits
         self.w_bits = w_bits
-        self._use_w4a4 = _NUNCHAKU_AVAILABLE and a_bits == 4 and w_bits == 4
+        
+        self._use_w4a4 = _NUNCHAKU_AVAILABLE and a_bits == w_bits and a_bits in [2, 3, 4]
+        if self._use_w4a4:
+            if a_bits == 4:
+                self._quant_fn_w4a4 = _symmetric_int4_quant
+            elif a_bits == 3:
+                self._quant_fn_w4a4 = _symmetric_int3_quant
+            elif a_bits == 2:
+                self._quant_fn_w4a4 = _symmetric_int2_quant
+        
         self._w4a4_ready = False
+        
     def forward(self, input):
         if (
             self._use_w4a4
@@ -431,13 +520,14 @@ class RobuQLinear(nn.Linear):
 
     def prepare_for_inference(self):
         if not self._use_w4a4:
-            warnings.warn("W4A4 kernel不可用，回退到浮点前向。", RuntimeWarning)
+            warnings.warn(f"W{self.w_bits}A{self.n_bits} kernel 不可用或未启用, 回退到浮点前向。", RuntimeWarning)
             return
         if self._w4a4_ready:
             return
         if self.weight.device.type != "cuda":
-            warnings.warn("W4A4推理需要CUDA设备。", RuntimeWarning)
+            warnings.warn(f"W{self.w_bits}A{self.n_bits} (W4A4 Kernel) 推理需要CUDA设备。", RuntimeWarning)
             return
+            
         weight_fp16 = self.weight.detach().to(torch.float16)
         qweight, wscales = self._quantize_weight_w4a4(weight_fp16)
         self._w4a4_qweight = qweight
@@ -452,18 +542,18 @@ class RobuQLinear(nn.Linear):
 
     def _quantize_weight_w4a4(self, weight_fp16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._use_w4a4:
-            raise RuntimeError("W4A4量化未启用")
+            raise RuntimeError("W4A4兼容量化未启用")
         n_pad = self._n_pad
         k_pad = self._k_pad
         weight_padded = torch.zeros((n_pad, k_pad), dtype=torch.float16, device=weight_fp16.device)
         weight_padded[: self.cout, : self.cin] = weight_fp16
         groups = weight_padded.view(n_pad, k_pad // INT4_GROUP_SIZE, INT4_GROUP_SIZE)
-        packed, scales = _symmetric_int4_quant(groups)
+        packed, scales = self._quant_fn_w4a4(groups) # 使用选择的量化函数
         return packed, scales
 
     def _quantize_activation_w4a4(self, input_fp16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
         if not self._use_w4a4:
-            raise RuntimeError("W4A4量化未启用")
+            raise RuntimeError("W4A4兼容量化未启用")
         batch, in_features = input_fp16.shape
         k_pad = self._k_pad
         if in_features > k_pad:
@@ -472,7 +562,7 @@ class RobuQLinear(nn.Linear):
         act_pad = torch.zeros((batch_pad, k_pad), dtype=torch.float16, device=input_fp16.device)
         act_pad[:batch, :in_features] = input_fp16
         groups = act_pad.view(batch_pad, k_pad // INT4_GROUP_SIZE, INT4_GROUP_SIZE)
-        packed, scales = _symmetric_int4_quant(groups)
+        packed, scales = self._quant_fn_w4a4(groups) # 使用选择的量化函数
         return packed, scales, batch_pad
 
     def _forward_w4a4(self, input: torch.Tensor) -> torch.Tensor:
@@ -507,7 +597,7 @@ class RobuQLinear(nn.Linear):
                 fp4=False,
             )
         except Exception as exc:
-            warnings.warn(f"W4A4 kernel调用失败，自动回退到浮点实现: {exc}", RuntimeWarning)
+            warnings.warn(f"W{self.w_bits}A{self.n_bits} (W4A4 Kernel) 调用失败, 自动回退到浮点实现: {exc}", RuntimeWarning)
             self._w4a4_ready = False
             return self._forward_fp(input)
 
