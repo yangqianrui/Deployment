@@ -25,11 +25,44 @@ CHANNEL_PAD = 128
 BATCH_PAD = 256
 N_RUNS = 100 # 测速运行次数
 WARMUP_RUNS = 10 # 预热次数
+INT3_BYTES_PER_GROUP = (GROUP_SIZE * 3) // 8
+INT4_BYTES_PER_GROUP = GROUP_SIZE // 2
+INT3_SEGMENTS_PER_GROUP = GROUP_SIZE // 8
 
 # --- Nunchaku (W4A4 Kernel) 辅助函数 ---
 
+def _expand_int3_packed(packed: torch.Tensor, rows: int, groups: int) -> torch.Tensor:
+    """
+    Expand packed int3 data (24 bytes / group) into int4-compatible nibbles
+    (32 bytes / group) by multiplying the decoded values by 2.
+    """
+    packed_u8 = packed.view(rows, groups, INT3_BYTES_PER_GROUP).to(torch.uint8)
+    expanded = torch.empty(rows, groups, INT4_BYTES_PER_GROUP, dtype=torch.uint8, device=packed.device)
+
+    for seg in range(INT3_SEGMENTS_PER_GROUP):
+        chunk = packed_u8[:, :, seg * 3 : seg * 3 + 3].to(torch.int32)
+        bits = chunk[..., 0] | (chunk[..., 1] << 8) | (chunk[..., 2] << 16)
+        for pair in range(4):
+            code0 = (bits >> (pair * 6)) & 0x7
+            code1 = (bits >> (pair * 6 + 3)) & 0x7
+            val0 = torch.where(code0 >= 4, code0 - 8, code0) << 1
+            val1 = torch.where(code1 >= 4, code1 - 8, code1) << 1
+            nibble0 = (val0 & 0xF).to(torch.uint8)
+            nibble1 = (val1 & 0xF).to(torch.uint8)
+            expanded[:, :, seg * 4 + pair] = nibble0 | (nibble1 << 4)
+
+    return expanded.view(rows, groups * INT4_BYTES_PER_GROUP)
+
+
 def _unpack_weight(packed: torch.Tensor, N_pad: int, K: int) -> torch.Tensor:
-    u8 = packed.view(N_pad, K // 2).to(torch.uint8)
+    groups = K // GROUP_SIZE
+    expected_int4 = groups * INT4_BYTES_PER_GROUP
+    if packed.shape[-1] == expected_int4:
+        u8 = packed.view(N_pad, expected_int4).to(torch.uint8)
+    else:
+        assert packed.shape[-1] == groups * INT3_BYTES_PER_GROUP, "Unexpected packed weight shape"
+        u8 = _expand_int3_packed(packed, N_pad, groups)
+    u8 = u8.view(N_pad, K // 2).to(torch.uint8)
     lo = (u8 & 0x0F).to(torch.int16)
     hi = (u8 >> 4).to(torch.int16)
     lo = torch.where(lo >= 8, lo - 16, lo)
@@ -39,7 +72,14 @@ def _unpack_weight(packed: torch.Tensor, N_pad: int, K: int) -> torch.Tensor:
 
 
 def _unpack_activation(packed: torch.Tensor, M_pad: int, K: int) -> torch.Tensor:
-    u8 = packed.view(M_pad, K // 2).to(torch.uint8)
+    groups = K // GROUP_SIZE
+    expected_int4 = groups * INT4_BYTES_PER_GROUP
+    if packed.shape[-1] == expected_int4:
+        u8 = packed.view(M_pad, expected_int4).to(torch.uint8)
+    else:
+        assert packed.shape[-1] == groups * INT3_BYTES_PER_GROUP, "Unexpected packed activation shape"
+        u8 = _expand_int3_packed(packed, M_pad, groups)
+    u8 = u8.view(M_pad, K // 2).to(torch.uint8)
     lo = (u8 & 0x0F).to(torch.int16)
     hi = (u8 >> 4).to(torch.int16)
     lo = torch.where(lo >= 8, lo - 16, lo)

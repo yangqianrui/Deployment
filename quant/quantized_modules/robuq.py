@@ -66,6 +66,37 @@ def _pack_int4_blocks(q: torch.Tensor) -> torch.Tensor:
     return packed.reshape(q.shape[0], -1)
 
 
+def _pack_int3_blocks(q: torch.Tensor) -> torch.Tensor:
+    """
+    Pack signed int3 values into a compact uint8 representation.
+
+    Each 64-value group is divided into 8 segments. Every segment stores 8
+    signed 3-bit numbers (two's complement) packed into 3 consecutive bytes.
+    """
+    if q.dtype not in (torch.int16, torch.int32, torch.int64):
+        raise TypeError("Expected signed integer tensor for int3 packing.")
+    if q.shape[-1] != 64:
+        raise ValueError("Last dimension must be 64 for int3 packing.")
+
+    q_int = q.to(torch.int16).contiguous()
+    encoded = torch.where(q_int < 0, q_int + 8, q_int).to(torch.int16)
+
+    prefix_shape = encoded.shape[:-1]
+    segments = encoded.view(*prefix_shape, 8, 8).to(torch.int32)
+
+    shifts = torch.tensor([0, 3, 6, 9, 12, 15, 18, 21],
+                          device=segments.device,
+                          dtype=torch.int32).view(*((1,) * (segments.dim() - 1)), 8)
+    bits = (segments << shifts).sum(dim=-1, dtype=torch.int32)
+
+    byte_shifts = torch.tensor([0, 8, 16],
+                               device=segments.device,
+                               dtype=torch.int32).view(*((1,) * bits.dim()), 3)
+    packed = ((bits.unsqueeze(-1) >> byte_shifts) & 0xFF).to(torch.uint8)
+
+    return packed.reshape(q.shape[0], -1)
+
+
 def _symmetric_int4_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize grouped values to int4 with per-sample scales.
 
@@ -90,8 +121,9 @@ def _symmetric_int4_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
 def _symmetric_int3_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize grouped values to int3, but pack as int4 for compatibility.
-    Upscales quantized values by 2 (range [-8, 6]) and adjusts scale by / 2.0.
+    Quantize grouped values to signed int3 and pack them densely.
+    Scales are halved so that the CUDA path can expand each value to int4
+    (multiply by 2) before invoking the W4A4 kernel.
     """
     if groups.dtype not in (torch.float16, torch.float32, torch.bfloat16):
         raise TypeError("Expected floating tensor for int3 quantization.")
@@ -103,13 +135,10 @@ def _symmetric_int3_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     # Quantize to [-4, 3]
     q = torch.round(groups / scale.unsqueeze(-1)).clamp(-4, 3)
     
-    # Upscale to 4-bit range [-8, 6]
-    q_upscaled = (q * 2).to(torch.int16)
-    
     # Adjust scale
     scale_adjusted = scale / 2.0
-    
-    packed = _pack_int4_blocks(q_upscaled)
+
+    packed = _pack_int3_blocks(q.to(torch.int16))
     return packed.contiguous(), scale_adjusted.transpose(0, 1).contiguous().to(torch.float16)
 
 def _symmetric_int2_quant(groups: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
