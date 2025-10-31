@@ -148,16 +148,33 @@ def run_benchmark_nunchaku(
     print(f"  Avg. Kernel Time: {elapsed_ms:.6f} ms")
 
 
-# --- 基准测试函数 (PyTorch Native W8A8) ---
+# --- 通用辅助函数 (基于 PyTorch INT8 Kernel 的 N-bit 量化) ---
 
-def run_benchmark_torch_w8a8(
+def _quantize_tensor_to_nbits(
+    tensor: torch.Tensor, 
+    bits: int, 
+    eps: float = 1e-6
+) -> torch.Tensor:
+    if bits < 2 or bits > 8:
+        raise ValueError(f"仅支持 2-8 bit 量化, 当前 bits={bits}")
+    qmax = (1 << (bits - 1)) - 1
+    if qmax <= 0:
+        raise ValueError(f"bits={bits} 导致无效的量化级数")
+    max_abs = tensor.abs().max()
+    scale = float(max_abs) / qmax if max_abs > eps else 1.0
+    return torch.quantize_per_tensor(tensor, scale, 0, torch.qint8)
+
+
+def run_benchmark_torch_intx(
+    bits: int,
     device: torch.device, 
     batch: int, 
     in_features: int, 
-    out_features: int
+    out_features: int,
+    note: str
 ) -> None:
-    
-    bit_name = "W8A8 (Torch Native)"
+
+    bit_name = f"W{bits}A{bits} ({note})"
     print(f"\n--- 正在运行 {bit_name} 基准测试 ---")
 
     # PyTorch 的 QInt 算子通常需要 float32 输入
@@ -166,26 +183,14 @@ def run_benchmark_torch_w8a8(
     bias = torch.randn(out_features, device=device, dtype=torch.float32)
 
     # --- 精度验证 (Ref Sim) ---
-    # 使用 per-tensor 量化激活
-    a_max = activations.abs().max()
-    a_scale = a_max / 127.0 if a_max > 1e-6 else 1.0
-    a_zp = 0
-    q_act_ref = torch.quantize_per_tensor(activations, a_scale, a_zp, torch.qint8)
-
-    # 使用 per-tensor 量化权重
-    w_max_abs = weight.abs().max()
-    w_scale = w_max_abs / 127.0 if w_max_abs > 1e-6 else 1.0
-    w_zp = 0 
-    q_weight_ref = torch.quantize_per_tensor(weight, w_scale, w_zp, torch.qint8)
+    # 使用受限范围的 per-tensor 量化 (数值仍保存在 int8 中)
+    q_act = _quantize_tensor_to_nbits(activations, bits)
+    q_weight = _quantize_tensor_to_nbits(weight, bits)
 
     # 浮点参考 (使用反量化后的值)
-    # 注意：这里使用 F.linear (浮点)
-    ref_sim = F.linear(q_act_ref.dequantize(), q_weight_ref.dequantize(), bias)
+    ref_sim = F.linear(q_act.dequantize(), q_weight.dequantize(), bias)
 
     # --- 准备 W8A8 运算 ---
-    q_act = torch.quantize_per_tensor(activations, a_scale, a_zp, torch.qint8)
-    q_weight = torch.quantize_per_tensor(weight, w_scale, w_zp, torch.qint8) 
-
     # --- 测速 ---
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -262,9 +267,25 @@ def main() -> None:
         device=device, batch=batch, in_features=in_features, out_features=out_features
     )
     
+    # 运行 W5A5 (基于 INT8 Kernel)
+    run_benchmark_torch_intx(
+        bits=5,
+        device=device, batch=batch, in_features=in_features, out_features=out_features,
+        note="Simulated on Torch INT8 Kernel"
+    )
+
+    # 运行 W6A6 (基于 INT8 Kernel)
+    run_benchmark_torch_intx(
+        bits=6,
+        device=device, batch=batch, in_features=in_features, out_features=out_features,
+        note="Simulated on Torch INT8 Kernel"
+    )
+
     # 运行 W8A8 (Torch Native)
-    run_benchmark_torch_w8a8(
-        device=device, batch=batch, in_features=in_features, out_features=out_features
+    run_benchmark_torch_intx(
+        bits=8,
+        device=device, batch=batch, in_features=in_features, out_features=out_features,
+        note="Torch Native"
     )
 
 if __name__ == "__main__":

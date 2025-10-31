@@ -76,7 +76,7 @@ def main():
 
     results = {}
     # 新增 8-bit 到测试列表
-    for bits in [2, 3, 4, 8]:
+    for bits in [2, 3, 4, 5, 6, 8]:
         avg_time = benchmark_fp(bits, DEVICE, BATCH_SIZE, IN_FEATURES, OUT_FEATURES)
         results[f"W{bits}A{bits} (FP)"] = avg_time
         
