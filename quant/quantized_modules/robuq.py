@@ -41,8 +41,72 @@ UNIFORM_QUANT_TABLE = {
     7: {'a_opt': 3.639531, 'delta': 0.056868, 'mse': 0.00030433},
     8: {'a_opt': 3.937585, 'delta': 0.030762, 'mse': 0.00008769}
 }
+TABLE = {
+    1: {'delta': 1.595769, 'a_opt': 0.797885, 'mse': 0.36338023, 'method': 'sign_theoretical'},
+    2: {'delta': 0.995687, 'a_opt': 1.991374, 'mse': 0.11884605, 'method': 'uniform_theoretical'},
+    3: {'delta': 0.586019, 'a_opt': 2.344078, 'mse': 0.03743966, 'method': 'uniform_theoretical'},
+    4: {'delta': 0.335201, 'a_opt': 2.681605, 'mse': 0.01154288, 'method': 'uniform_theoretical'},
+    5: {'delta': 0.188139, 'a_opt': 3.010220, 'mse': 0.00349521, 'method': 'uniform_theoretical'},
+    6: {'delta': 0.104063, 'a_opt': 3.330017, 'mse': 0.00104005, 'method': 'uniform_theoretical'},
+    7: {'delta': 0.056868, 'a_opt': 3.639531, 'mse': 0.00030433, 'method': 'uniform_theoretical'},
+    8: {'delta': 0.030762, 'a_opt': 3.937585, 'mse': 0.00008769, 'method': 'uniform_theoretical'},
+}
 
+@torch.jit.script
+def fused_quantact_uniform_quant(x: torch.Tensor, delta: torch.Tensor,
+                                bits: int, dim: int = -1) -> torch.Tensor:
+    """
+    完全融合的QuantAct + UniformQuant操作（TorchScript编译版本）
+    
+    融合了QuantAct的完整预处理流程：
+    1. 对称化处理（中心化）
+    2. MAD方差估计
+    3. 归一化
+    4. UniformQuant量化
+    5. 反归一化
+    
+    功能等效于: QuantAct(UniformQuantSTE(bits)).forward(x, dim)
+    """
+   # mad = torch.std(x, dim=dim, keepdim=True)
+    mad = torch.abs(x).mean(dim=dim, keepdim=True) * 1.2533141373155001
+    # 避免除零，设置最小阈值
+    # ==== 步骤3: 归一化 ====
+    x_norm = x / (mad*delta)
+    # ==== 步骤4: UniformQuant量化 ====
+    # 量化 - 使用torch.round()（与Python round()有微小差异，可忽略）
+    x_quant = torch.round(x_norm)
+    
+    # 对称量化范围：[-2^(bits-1), 2^(bits-1)-1]
+    # 这样确保负数范围比正数范围多1，但0被包含在正数范围内
+    quant_max_val = 2**(bits-1)
+    x_quant = torch.clamp(x_quant, -quant_max_val, quant_max_val-1)
+    
+    # 反量化 (STE)
+    
+    # ==== 步骤5: 反归一化 ====
+    x_denorm = x_quant * mad * delta 
+    
+    # ==== 步骤6: 反中心化 ====
+   # x_final = x_denorm + mean
+    
+    # STE梯度传播
+    return x + (x_denorm - x).detach()
 
+class FusedUniformQuantSTE(nn.Module):#使用THEORETICAL_OPTIMAL_TABLE
+    def __init__(self,bits):
+        super().__init__()
+        assert bits in TABLE, f"Unsupported bit-width {bits}, must be 1-8"
+        self.bits = bits
+        self.config = TABLE[bits]
+        self.delta = self.config['delta']
+        self.register_buffer('delta_tensor', torch.tensor(self.delta))
+        # 添加设备同步标志，避免重复同步
+        self._device_synced = False
+    def forward(self, x):
+        if not self._device_synced:
+            self.delta_tensor = self.delta_tensor.to(x.device)
+            self._device_synced = True
+        return fused_quantact_uniform_quant(x, self.delta_tensor, self.bits, dim=-1)
 
 def _pack_int4_blocks(q: torch.Tensor) -> torch.Tensor:
     """Pack signed int4 values into uint8 (for nunchaku compatibility).
